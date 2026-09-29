@@ -312,3 +312,10 @@ def evaluate_herd_risk_from_db():
 
     cows = list(records)  # already CowRecordInput (subclass of CowSensorInput)
     return build_herd_risk_summary('FARM_001', cows)
+
+
+@app.get('/herd_risk_csv', response_model=HerdRiskResponse, include_in_schema=False)
+@app.get('/herd_risk', response_model=HerdRiskResponse, include_in_schema=False)
+def evaluate_herd_risk_legacy_alias():
+    """Backward-compatible aliases that serve the database-backed herd summary."""
+    return evaluate_herd_risk_from_db()
