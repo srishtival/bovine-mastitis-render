@@ -2,7 +2,7 @@ import json
 import datetime
 from src.models.calibration import map_risk_tier
 
-def generate_clinician_alert(cow_id, probability, uncertainty=0.05, forecast_horizon=3, top_factors=None, timestamp=None, clinical_override=False):
+def generate_clinician_alert(cow_id, probability, uncertainty=0.05, forecast_horizon=3, top_factors=None, timestamp=None, clinical_override=False, farmer_id=""):
     """
     Generates a clinician-safe, structured alert JSON object.
     Strictly avoids prescribing antimicrobial treatments.
@@ -30,6 +30,7 @@ def generate_clinician_alert(cow_id, probability, uncertainty=0.05, forecast_hor
     ]
     
     alert = {
+        "farmer_id": farmer_id,
         "cow_id": cow_id,
         "timestamp": timestamp,
         "mastitis_risk_probability": round(probability, 4),

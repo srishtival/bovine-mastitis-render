@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from typing import List, Literal
 
 class CowSensorInput(BaseModel):
+    farmer_id: str = Field(..., example="FARMER_001", description="Identifier of the farmer/farm the cow belongs to")
     cow_id: str = Field(..., example="C0001")
     milk_ec: float = Field(..., example=4.4)
     milk_temperature_c: float = Field(..., example=38.25)
@@ -31,6 +32,7 @@ class CowLatestRecordResponse(CowSensorInput):
     pass
 
 class PredictionResponse(BaseModel):
+    farmer_id: str = ""
     cow_id: str
     mastitis_risk_probability: float
     risk_category: str

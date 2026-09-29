@@ -1,7 +1,6 @@
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-import csv
 import os
 import pickle
 import datetime
@@ -13,6 +12,14 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.schemas import CowSensorInput, CowRecordInput, PredictionResponse, HerdRiskInput, HerdRiskResponse
+from src.api.db import (
+    insert_observation_with_prediction,
+    fetch_latest_record_for_cow,
+    fetch_latest_record_per_cow,
+    record_to_cow_sensor_input_dict,
+    get_connection,
+    TABLE,
+)
 from src.explainability.alert_generator import generate_clinician_alert
 from src.herd.herd_engine import calculate_herd_risk_summary
 
@@ -48,7 +55,6 @@ MODEL_PATHS = {
         "label": MODEL_DIR / "mastitis_risk_label_14d_final.pkl",
     },
 }
-CSV_RECORD_PATH = ROOT_DIR / "myapp_cow_mastitis_records.csv"
 MODEL_FEATURES = [
     'milk_ec', 'milk_temperature_c', 'udder_temperature_c', 'activity_index',
     'milk_colour_code',
@@ -57,14 +63,6 @@ MODEL_FEATURES = [
     'udder_temp_deviation_c', 'activity_deviation', 'milk_ec_slope',
     'udder_temp_slope', 'activity_slope', 'milk_ec_variability',
     'udder_temp_variability', 'activity_variability',
-]
-CSV_HEADERS = [
-    'cow_id',
-    'timestamp',
-    *MODEL_FEATURES,
-    'risk_score',
-    'risk_label',
-    'forecast_horizon_days',
 ]
 
 @lru_cache(maxsize=1)
@@ -117,10 +115,21 @@ def health_check():
         except Exception as exc:
             models[str(horizon)] = False
             load_error = str(exc)
+
+    db_ok = False
+    db_error = None
+    try:
+        get_connection().execute("SELECT 1")
+        db_ok = True
+    except Exception as exc:
+        db_error = str(exc)
+
     return {
-        "status": "healthy" if all(models.values()) else "degraded",
+        "status": "healthy" if (all(models.values()) and db_ok) else "degraded",
         "model_loaded": all(models.values()),
         "models_loaded": models,
+        "database_connected": db_ok,
+        "database_error": db_error,
         "model_features": MODEL_FEATURES,
         "load_error": load_error,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -157,6 +166,7 @@ def predict_individual_cow(inp: CowSensorInput):
 
     alert = generate_clinician_alert(
         cow_id=inp.cow_id,
+        farmer_id=inp.farmer_id,
         probability=prob,
         uncertainty=0.05,
         forecast_horizon=horizon,
@@ -168,7 +178,7 @@ def predict_individual_cow(inp: CowSensorInput):
 
 
 def build_model_features(inp: CowSensorInput) -> dict[str, float]:
-    """Build the model's derived features from the nine client inputs."""
+    """Build the model's derived features from the client inputs."""
     feature_values = {
         'milk_ec': inp.milk_ec,
         'milk_temperature_c': inp.milk_temperature_c,
@@ -195,107 +205,47 @@ def build_model_features(inp: CowSensorInput) -> dict[str, float]:
 @app.post("/append_cow_record")
 def append_cow_record(inp: CowRecordInput):
     prediction = predict_individual_cow(inp)
-    features = build_model_features(inp)
-    record = {
-        'cow_id': inp.cow_id,
-        'timestamp': prediction['timestamp'],
-        **features,
-        'risk_score': prediction['mastitis_risk_probability'],
-        'risk_label': prediction['risk_category'],
-        'forecast_horizon_days': inp.forecast_horizon_days,
-    }
 
-    file_exists = os.path.exists(CSV_RECORD_PATH)
-    if file_exists:
-        with open(CSV_RECORD_PATH, newline='') as existing_file:
-            existing_headers = csv.DictReader(existing_file).fieldnames or []
-        if 'forecast_horizon_days' not in existing_headers or 'milk_colour_code' not in existing_headers:
-            with open(CSV_RECORD_PATH, newline='') as existing_file:
-                existing_rows = list(csv.DictReader(existing_file))
-            with open(CSV_RECORD_PATH, 'w', newline='') as migrated_file:
-                writer = csv.DictWriter(migrated_file, fieldnames=CSV_HEADERS)
-                writer.writeheader()
-                for existing_row in existing_rows:
-                    existing_row.setdefault('forecast_horizon_days', 7)
-                    existing_row.setdefault('milk_colour_code', 0)
-                    writer.writerow(existing_row)
-    with open(CSV_RECORD_PATH, 'a', newline='') as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=CSV_HEADERS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(record)
+    try:
+        row_id = insert_observation_with_prediction(inp, prediction)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to store observation in the database: {exc}",
+        ) from exc
 
     return {
         'status': 'saved',
-        'file_path': str(CSV_RECORD_PATH),
+        'storage': 'postgresql',
+        'table': TABLE,
+        'record_id': row_id,
         'cow_id': inp.cow_id,
         **prediction,
     }
 
 
-def get_latest_record_for_cow(cow_id: str):
-    if not os.path.exists(CSV_RECORD_PATH):
-        raise HTTPException(status_code=404, detail=f'No saved records found for cow {cow_id}')
+def get_latest_record_for_cow(cow_id: str) -> CowRecordInput:
+    try:
+        record = fetch_latest_record_for_cow(cow_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
 
-    target_cow_id = cow_id.strip().upper()
-    latest_record = None
-    with open(CSV_RECORD_PATH, newline='') as csv_file:
-        reader = csv.DictReader(csv_file)
-        for row in reader:
-            row_cow_id = (row.get('cow_id') or '').strip().upper()
-            if row_cow_id == target_cow_id:
-                latest_record = row
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No saved records found for cow {cow_id}")
 
-    if latest_record is None:
-        raise HTTPException(status_code=404, detail=f'No saved records found for cow {cow_id}')
-
-    return {
-        'cow_id': latest_record['cow_id'],
-        'timestamp': latest_record.get('timestamp'),
-        'milk_ec': float(latest_record['milk_ec']),
-        'milk_temperature_c': float(latest_record['milk_temperature_c']),
-        'udder_temperature_c': float(latest_record['udder_temperature_c']),
-        'activity_index': float(latest_record['activity_index']),
-        'milk_colour_code': int(float(latest_record.get('milk_colour_code') or 0)),
-        'milk_ec_baseline': float(latest_record['milk_ec_baseline']),
-        'milk_temp_baseline_c': float(latest_record['milk_temp_baseline_c']),
-        'udder_temp_baseline_c': float(latest_record['udder_temp_baseline_c']),
-        'activity_baseline': float(latest_record['activity_baseline']),
-        'forecast_horizon_days': int(latest_record.get('forecast_horizon_days') or 7),
-    }
+    return CowRecordInput(**record_to_cow_sensor_input_dict(record))
 
 
-def get_all_latest_records_for_cows():
-    if not os.path.exists(CSV_RECORD_PATH):
-        return []
+def get_all_latest_records_for_cows() -> list[CowRecordInput]:
+    try:
+        records = fetch_latest_record_per_cow()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database error: {exc}") from exc
 
-    latest_by_cow = {}
-    with open(CSV_RECORD_PATH, newline='') as csv_file:
-        reader = csv.DictReader(csv_file)
-        for row in reader:
-            cow_id = (row.get('cow_id') or '').strip()
-            if not cow_id:
-                continue
-            latest_by_cow[cow_id] = row
-
-    records = []
-    for cow_id, latest_row in latest_by_cow.items():
-        records.append({
-            'cow_id': latest_row['cow_id'],
-            'timestamp': latest_row.get('timestamp'),
-            'milk_ec': float(latest_row['milk_ec']),
-            'milk_temperature_c': float(latest_row['milk_temperature_c']),
-            'udder_temperature_c': float(latest_row['udder_temperature_c']),
-            'activity_index': float(latest_row['activity_index']),
-            'milk_colour_code': int(float(latest_row.get('milk_colour_code') or 0)),
-            'milk_ec_baseline': float(latest_row['milk_ec_baseline']),
-            'milk_temp_baseline_c': float(latest_row['milk_temp_baseline_c']),
-            'udder_temp_baseline_c': float(latest_row['udder_temp_baseline_c']),
-            'activity_baseline': float(latest_row['activity_baseline']),
-            'forecast_horizon_days': int(latest_row.get('forecast_horizon_days') or 7),
-        })
-
-    return sorted(records, key=lambda r: r['cow_id'])
+    return [
+        CowRecordInput(**record_to_cow_sensor_input_dict(record))
+        for record in records
+    ]
 
 
 @app.get('/cow_latest_record/{cow_id}', response_model=CowRecordInput)
@@ -319,7 +269,7 @@ def build_herd_risk_summary(farm_id: str, cows: list[CowSensorInput]):
         })
 
     if not predictions:
-        raise HTTPException(status_code=404, detail='No saved records found in the CSV file.')
+        raise HTTPException(status_code=404, detail='No saved records found in the database.')
 
     df_preds = pd.DataFrame(predictions)
     summary = calculate_herd_risk_summary(df_preds)
@@ -344,8 +294,8 @@ def evaluate_herd_risk(inp: HerdRiskInput):
     return build_herd_risk_summary(inp.farm_id, inp.cows)
 
 
-@app.get('/herd_risk_csv', response_model=HerdRiskResponse)
-def evaluate_herd_risk_from_csv():
+@app.get('/herd_risk_db', response_model=HerdRiskResponse)
+def evaluate_herd_risk_from_db():
     records = get_all_latest_records_for_cows()
     if not records:
         return {
@@ -360,5 +310,5 @@ def evaluate_herd_risk_from_csv():
             "anomaly_alert": False,
         }
 
-    cows = [CowSensorInput(**record) for record in records]
+    cows = list(records)  # already CowRecordInput (subclass of CowSensorInput)
     return build_herd_risk_summary('FARM_001', cows)
